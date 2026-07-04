@@ -1,0 +1,231 @@
+# Build the `shards` map fake_io() expects (pattern -> file path) from a prior
+# run's out_dir, as if every asset it wrote had been published to the release.
+release_shards <- function(dir) {
+  files <- list.files(dir, pattern = "\\.(db|json)$")
+  stats::setNames(file.path(dir, files), files)
+}
+
+test_that("cold bootstrap builds year shards, recent, summary, and manifest", {
+  shard_2017 <- paste0(SHARD_PREFIX, "-2017.db")
+  shard_2026 <- paste0(SHARD_PREFIX, "-2026.db")
+  shard_recent <- paste0(SHARD_PREFIX, "-recent.db")
+  shard_summary <- paste0(SHARD_PREFIX, "-summary.db")
+
+  out <- withr::local_tempdir()
+  daily <- data.frame(
+    date = c("2017-04-05", "2026-06-29", "2026-06-30"),
+    package = c("r-mass", "r-mass", "r-ggplot2"),
+    count = c(1L, 10L, 5L), stringsAsFactors = FALSE)
+  io <- fake_io(release_present = FALSE, daily = daily,
+                cran = c("MASS", "ggplot2"), now = "2026-07-01 05:00:00")
+  res <- run_update(io, out, force_full = FALSE)
+  expect_true(file.exists(file.path(out, shard_2017)))
+  expect_true(file.exists(file.path(out, shard_2026)))
+  expect_true(file.exists(file.path(out, shard_recent)))
+  expect_true(file.exists(file.path(out, shard_summary)))
+  man <- jsonlite::fromJSON(file.path(out, "manifest.json"))
+  expect_true(shard_2026 %in% man$changed_shards)
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, shard_summary)); on.exit(DBI::dbDisconnect(con))
+  s <- DBI::dbGetQuery(con, sprintf("SELECT * FROM %s WHERE package='r-mass'", SUMMARY_TABLE))
+  expect_equal(s$origin, "cran"); expect_equal(s$canonical_name, "MASS")
+})
+
+test_that("incremental run adds a new day and touches only that year, recent, and summary", {
+  shard_2017 <- paste0(SHARD_PREFIX, "-2017.db")
+  shard_2026 <- paste0(SHARD_PREFIX, "-2026.db")
+  shard_recent <- paste0(SHARD_PREFIX, "-recent.db")
+  shard_summary <- paste0(SHARD_PREFIX, "-summary.db")
+
+  out1 <- withr::local_tempdir()
+  daily1 <- data.frame(
+    date = c("2017-04-05", "2026-06-29", "2026-06-30"),
+    package = c("r-mass", "r-mass", "r-ggplot2"),
+    count = c(1L, 10L, 5L), stringsAsFactors = FALSE)
+  io1 <- fake_io(release_present = FALSE, daily = daily1,
+                 cran = c("MASS", "ggplot2"), now = "2026-07-01 05:00:00")
+  run_update(io1, out1, force_full = FALSE)
+
+  out2 <- withr::local_tempdir()
+  daily2 <- rbind(daily1, data.frame(
+    date = "2026-07-01", package = "r-mass", count = 7L, stringsAsFactors = FALSE))
+  io2 <- fake_io(release_present = TRUE, daily = daily2,
+                 cran = c("MASS", "ggplot2"), now = "2026-07-02 05:00:00",
+                 shards = release_shards(out1))
+  res2 <- run_update(io2, out2, force_full = FALSE)
+
+  expect_setequal(res2$changed_shards, c(shard_2026, shard_recent, shard_summary))
+  expect_false(shard_2017 %in% res2$changed_shards)
+
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out2, shard_2026))
+  on.exit(DBI::dbDisconnect(con))
+  d <- DBI::dbGetQuery(con,
+    sprintf("SELECT count FROM %s WHERE package='r-mass' AND date='2026-07-01'", DAILY_TABLE))
+  expect_equal(d$count, 7L)
+})
+
+test_that("an incremental run whose re-fetch is unchanged yields no changed shards but still refreshes the manifest", {
+  out1 <- withr::local_tempdir()
+  daily <- data.frame(
+    date = c("2017-04-05", "2026-06-29", "2026-06-30"),
+    package = c("r-mass", "r-mass", "r-ggplot2"),
+    count = c(1L, 10L, 5L), stringsAsFactors = FALSE)
+  io1 <- fake_io(release_present = FALSE, daily = daily,
+                 cran = c("MASS", "ggplot2"), now = "2026-07-01 05:00:00")
+  run_update(io1, out1, force_full = FALSE)
+  man1 <- jsonlite::fromJSON(file.path(out1, "manifest.json"))
+
+  out2 <- withr::local_tempdir()
+  io2 <- fake_io(release_present = TRUE, daily = daily,   # identical source data, nothing new
+                 cran = c("MASS", "ggplot2"), now = "2026-07-01 15:00:00",
+                 shards = release_shards(out1))
+  res2 <- run_update(io2, out2, force_full = FALSE)
+
+  expect_length(res2$changed_shards, 0L)
+  man2 <- jsonlite::fromJSON(file.path(out2, "manifest.json"))
+  expect_equal(man2$last_changed, man1$last_changed)   # carried forward, not bumped
+  expect_true(man2$last_checked > man1$last_checked)   # but the check itself is recorded
+})
+
+test_that("incremental run aborts rather than publish a truncated shard when a touched-year shard listed in the prior manifest fails to download", {
+  shard_2026 <- paste0(SHARD_PREFIX, "-2026.db")
+
+  out1 <- withr::local_tempdir()
+  daily1 <- data.frame(
+    date = c("2017-04-05", "2026-06-29", "2026-06-30"),
+    package = c("r-mass", "r-mass", "r-ggplot2"),
+    count = c(1L, 10L, 5L), stringsAsFactors = FALSE)
+  io1 <- fake_io(release_present = FALSE, daily = daily1,
+                 cran = c("MASS", "ggplot2"), now = "2026-07-01 05:00:00")
+  run_update(io1, out1, force_full = FALSE)
+  man1 <- jsonlite::fromJSON(file.path(out1, "manifest.json"))
+  expect_true(shard_2026 %in% names(man1$shards))  # sanity: prior manifest lists it
+
+  out2 <- withr::local_tempdir()
+  daily2 <- rbind(daily1, data.frame(
+    date = "2026-07-01", package = "r-mass", count = 7L, stringsAsFactors = FALSE))
+  broken_shards <- as.list(release_shards(out1))
+  broken_shards[[shard_2026]] <- NULL  # published per manifest, but unfetchable this run
+  io2 <- fake_io(release_present = TRUE, daily = daily2,
+                 cran = c("MASS", "ggplot2"), now = "2026-07-02 05:00:00",
+                 shards = broken_shards)
+
+  expect_error(run_update(io2, out2, force_full = FALSE), "protect")
+  # The prior manifest was downloaded (needed to determine the revision window)
+  # but never rewritten, and the touched-year shard was never (re-)exported.
+  man2 <- jsonlite::fromJSON(file.path(out2, "manifest.json"))
+  expect_equal(man2$tag, man1$tag)
+  expect_false(file.exists(file.path(out2, shard_2026)))
+})
+
+test_that("incremental run aborts rather than treat as cold start when the recent shard cannot be downloaded", {
+  shard_2026 <- paste0(SHARD_PREFIX, "-2026.db")
+  shard_recent <- paste0(SHARD_PREFIX, "-recent.db")
+  shard_summary <- paste0(SHARD_PREFIX, "-summary.db")
+
+  out1 <- withr::local_tempdir()
+  daily1 <- data.frame(
+    date = c("2017-04-05", "2026-06-29", "2026-06-30"),
+    package = c("r-mass", "r-mass", "r-ggplot2"),
+    count = c(1L, 10L, 5L), stringsAsFactors = FALSE)
+  io1 <- fake_io(release_present = FALSE, daily = daily1,
+                 cran = c("MASS", "ggplot2"), now = "2026-07-01 05:00:00")
+  run_update(io1, out1, force_full = FALSE)
+
+  out2 <- withr::local_tempdir()
+  broken_shards <- as.list(release_shards(out1))
+  broken_shards[[shard_recent]] <- NULL  # published per manifest, but unfetchable this run
+  io2 <- fake_io(release_present = TRUE, daily = daily1,
+                 cran = c("MASS", "ggplot2"), now = "2026-07-02 05:00:00",
+                 shards = broken_shards)
+
+  expect_error(run_update(io2, out2, force_full = FALSE), "protect accumulated history")
+  expect_false(file.exists(file.path(out2, shard_recent)))
+  expect_false(file.exists(file.path(out2, shard_2026)))
+  expect_false(file.exists(file.path(out2, shard_summary)))
+})
+
+test_that("incremental run heartbeats rather than errors when the daily source is unreachable", {
+  shard_2026 <- paste0(SHARD_PREFIX, "-2026.db")
+
+  out1 <- withr::local_tempdir()
+  daily1 <- data.frame(
+    date = c("2017-04-05", "2026-06-29", "2026-06-30"),
+    package = c("r-mass", "r-mass", "r-ggplot2"),
+    count = c(1L, 10L, 5L), stringsAsFactors = FALSE)
+  io1 <- fake_io(release_present = FALSE, daily = daily1,
+                 cran = c("MASS", "ggplot2"), now = "2026-07-01 05:00:00")
+  run_update(io1, out1, force_full = FALSE)
+  man1 <- jsonlite::fromJSON(file.path(out1, "manifest.json"))
+
+  out2 <- withr::local_tempdir()
+  io2 <- fake_io(release_present = TRUE, daily = daily1,
+                 cran = c("MASS", "ggplot2"), now = "2026-07-02 05:00:00",
+                 shards = release_shards(out1), fail_fetch = TRUE)
+  res2 <- run_update(io2, out2, force_full = FALSE)
+
+  expect_length(res2$changed_shards, 0L)
+  man2 <- jsonlite::fromJSON(file.path(out2, "manifest.json"))
+  expect_equal(man2$source_kind, "frozen")
+  expect_length(man2$changed_shards, 0L)
+  expect_equal(man2$last_changed, man1$last_changed)   # carried forward, not bumped
+  expect_false(file.exists(file.path(out2, shard_2026)))
+
+  notes <- readLines(file.path(out2, "release_notes.md"))
+  expect_true(any(grepl("source unreachable this run", notes)))
+})
+
+test_that("incremental run falls back to the cached packages table when cran_names fails", {
+  out1 <- withr::local_tempdir()
+  daily1 <- data.frame(
+    date = c("2017-04-05", "2026-06-29", "2026-06-30"),
+    package = c("r-mass", "r-mass", "r-ggplot2"),
+    count = c(1L, 10L, 5L), stringsAsFactors = FALSE)
+  io1 <- fake_io(release_present = FALSE, daily = daily1,
+                 cran = c("MASS", "ggplot2"), now = "2026-07-01 05:00:00")
+  run_update(io1, out1, force_full = FALSE)
+
+  out2 <- withr::local_tempdir()
+  daily2 <- rbind(daily1, data.frame(
+    date = "2026-07-01", package = "r-mass", count = 7L, stringsAsFactors = FALSE))
+  io2 <- fake_io(release_present = TRUE, daily = daily2,
+                 cran = character(0), now = "2026-07-02 05:00:00",
+                 shards = release_shards(out1), fail_cran = TRUE)
+  res2 <- run_update(io2, out2, force_full = FALSE)
+
+  shard_summary <- paste0(SHARD_PREFIX, "-summary.db")
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out2, shard_summary))
+  on.exit(DBI::dbDisconnect(con))
+  s <- DBI::dbGetQuery(con, sprintf("SELECT * FROM %s WHERE package='r-mass'", SUMMARY_TABLE))
+  expect_equal(s$origin, "cran")
+  expect_equal(s$canonical_name, "MASS")
+  s2 <- DBI::dbGetQuery(con, sprintf("SELECT * FROM %s WHERE package='r-ggplot2'", SUMMARY_TABLE))
+  expect_equal(s2$origin, "cran")
+  expect_equal(s2$canonical_name, "ggplot2")
+})
+
+test_that("a same-day re-run replaces rather than duplicates a revised (package, date) row", {
+  out1 <- withr::local_tempdir()
+  daily1 <- data.frame(
+    date = c("2017-04-05", "2026-06-29", "2026-06-30"),
+    package = c("r-mass", "r-mass", "r-ggplot2"),
+    count = c(1L, 10L, 5L), stringsAsFactors = FALSE)
+  io1 <- fake_io(release_present = FALSE, daily = daily1,
+                 cran = c("MASS", "ggplot2"), now = "2026-07-01 05:00:00")
+  run_update(io1, out1, force_full = FALSE)
+
+  out2 <- withr::local_tempdir()
+  daily2 <- daily1
+  daily2$count[daily2$date == "2026-06-29" & daily2$package == "r-mass"] <- 22L
+  io2 <- fake_io(release_present = TRUE, daily = daily2,
+                 cran = c("MASS", "ggplot2"), now = "2026-07-01 15:00:00",
+                 shards = release_shards(out1))
+  run_update(io2, out2, force_full = FALSE)
+
+  shard_recent <- paste0(SHARD_PREFIX, "-recent.db")
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out2, shard_recent))
+  on.exit(DBI::dbDisconnect(con))
+  rows <- DBI::dbGetQuery(con,
+    sprintf("SELECT count FROM %s WHERE package='r-mass' AND date='2026-06-29'", DAILY_TABLE))
+  expect_equal(nrow(rows), 1L)     # replaced, not duplicated
+  expect_equal(rows$count, 22L)
+})
