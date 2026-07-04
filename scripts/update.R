@@ -6,10 +6,9 @@
 # year-sharded SQLite to a rolling `current` GitHub release. run_update(io,
 # out_dir) takes an injectable io for offline testing.
 #
-# Only the cold-bootstrap path (no prior release, source reachable) is
-# implemented so far: full backfill from HISTORY_START to the current month.
-# The incremental accrual, heartbeat, and protect-history abort paths land in
-# a later change.
+# Cold-bootstraps full history from HISTORY_START on first run, then accrues
+# incrementally, heartbeating (and aborting rather than truncating history)
+# when the daily source or a prior release asset is unreachable.
 
 options(timeout = 600)
 
@@ -39,6 +38,15 @@ iso <- function(t) format(t, "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
 months_between <- function(start, end) {
   s <- as.Date(paste0(start, "-01")); e <- as.Date(paste0(end, "-01"))
   format(seq(s, e, by = "month"), "%Y-%m")
+}
+
+# The 4-digit year encoded in a year-shard filename ("<SHARD_PREFIX>-YYYY.db"),
+# or NA for a non-year shard (e.g. "-recent" or "-summary"). Used by force_full
+# to recover every year the prior manifest ever published, so a full rebuild
+# re-pulls all of them rather than just the touched-window year.
+shard_year <- function(name) {
+  pat <- sprintf("^%s-([0-9]{4})\\.db$", SHARD_PREFIX)
+  if (grepl(pat, name)) sub(pat, "\\1", name) else NA_character_
 }
 
 # Merge a downloaded shard's daily rows into the working DB via ATTACH +
@@ -102,13 +110,20 @@ run_update <- function(io, out_dir, force_full = FALSE) {
       if (nzchar(trimws(stmt))) DBI::dbExecute(work_con, stmt)
 
     load_daily_shard(work_con, recent_path)
+    prior_summary <- read_summary_table(recent_path)
     last_known <- DBI::dbGetQuery(work_con, sprintf("SELECT MAX(date) AS d FROM %s", DAILY_TABLE))$d
     if (is.na(last_known))
       stop("run_update: the downloaded recent shard has no daily rows; cannot ",
            "determine the incremental revision window")
 
-    months <- months_between(format(as.Date(last_known) - REVISION_WINDOW, "%Y-%m"),
-                              format(now, "%Y-%m"))
+    # force_full pulls the whole history window (so revised old months are
+    # re-fetched too), mirroring the cold-bootstrap path's month range instead
+    # of the normal trailing revision window.
+    months <- if (force_full)
+      months_between(HISTORY_START, format(now, "%Y-%m"))
+    else
+      months_between(format(as.Date(last_known) - REVISION_WINDOW, "%Y-%m"),
+                      format(now, "%Y-%m"))
     fresh <- tryCatch(io$fetch_daily(months), error = function(e) e)
     if (inherits(fresh, "error")) {
       # The daily-data source is unreachable this run. A prior release exists,
@@ -125,11 +140,19 @@ run_update <- function(io, out_dir, force_full = FALSE) {
       return(list(changed_shards = character(0), manifest = out))
     }
     fresh <- fresh[c("package", "date", "count")]
-    fresh <- fresh[fresh$date >= as.character(as.Date(last_known) - REVISION_WINDOW), , drop = FALSE]
+    if (!force_full)
+      fresh <- fresh[fresh$date >= as.character(as.Date(last_known) - REVISION_WINDOW), , drop = FALSE]
 
     # Pull the touched-year shards (years present in `fresh`) so each year's
     # full history is in the working DB before the fresh rows are merged in.
+    # force_full widens this to every year the prior manifest ever published
+    # (union'd with any years present in `fresh`), so the whole published
+    # history gets pulled into the working DB and re-exported below.
     touched_years <- if (nrow(fresh) > 0) sort(unique(substr(fresh$date, 1, 4))) else character(0)
+    if (force_full) {
+      prior_years <- Filter(Negate(is.na), vapply(names(prev_shards), shard_year, character(1)))
+      touched_years <- sort(unique(c(prior_years, touched_years)))
+    }
     for (yr in touched_years) {
       shard <- sprintf("%s-%s.db", SHARD_PREFIX, yr)
       st <- io$release_download(shard, out_dir)
@@ -178,14 +201,14 @@ run_update <- function(io, out_dir, force_full = FALSE) {
       merged$origin <- ifelse(is.na(merged$origin), "other", merged$origin)
       merged[c("package", "origin", "canonical_name")]
     })
-    pre_summary <- build_summary(work_con, ident, DAILY_TABLE)
+    pre_summary <- build_summary(work_con, ident, DAILY_TABLE, prior_summary = prior_summary)
 
     if (nrow(fresh) > 0)
       DBI::dbExecute(work_con,
         sprintf("INSERT OR REPLACE INTO %s (package, date, count) VALUES (?, ?, ?)", DAILY_TABLE),
         params = list(fresh$package, fresh$date, fresh$count))
 
-    post_summary <- build_summary(work_con, ident, DAILY_TABLE)
+    post_summary <- build_summary(work_con, ident, DAILY_TABLE, prior_summary = prior_summary)
 
     changed_shards <- character(0); shard_updates <- list()
     for (yr in touched_years) {
@@ -193,7 +216,10 @@ run_update <- function(io, out_dir, force_full = FALSE) {
       dy    <- extract_year(work_con, yr, DAILY_TABLE)
       export_shard(file.path(out_dir, shard), dy)
       shard_updates[[shard]] <- coverage(dy)
-      if (content_changed(pre_year[[shard]], dy, c("package", "date", "count")))
+      # force_full re-exports and republishes every year shard unconditionally
+      # (that is the point of a full rebuild), rather than only those whose
+      # content actually changed.
+      if (force_full || content_changed(pre_year[[shard]], dy, c("package", "date", "count")))
         changed_shards <- c(changed_shards, shard)
     }
 
@@ -202,9 +228,9 @@ run_update <- function(io, out_dir, force_full = FALSE) {
     embed_aux(recent_path, post_summary, ident)
     export_summary_shard(summary_path, post_summary)
     shard_updates[[basename(recent_path)]] <- coverage(r_rows)
-    if (content_changed(pre_recent, r_rows, c("package", "date", "count")))
+    if (force_full || content_changed(pre_recent, r_rows, c("package", "date", "count")))
       changed_shards <- c(changed_shards, basename(recent_path))
-    if (content_changed(pre_summary, post_summary, SUMMARY_COLS))
+    if (force_full || content_changed(pre_summary, post_summary, SUMMARY_COLS))
       changed_shards <- c(changed_shards, basename(summary_path))
 
     out <- list(
