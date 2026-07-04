@@ -30,6 +30,32 @@ test_that("cold bootstrap builds year shards, recent, summary, and manifest", {
   expect_equal(s$origin, "cran"); expect_equal(s$canonical_name, "MASS")
 })
 
+test_that("cold bootstrap resolves both bioc and cran origins end-to-end through run_update", {
+  shard_summary <- paste0(SHARD_PREFIX, "-summary.db")
+
+  out <- withr::local_tempdir()
+  daily <- data.frame(
+    date = c("2026-06-29", "2026-06-30"),
+    package = c("bioconductor-deseq2", "r-mass"),
+    count = c(10L, 5L), stringsAsFactors = FALSE)
+  io <- fake_io(release_present = FALSE, daily = daily,
+                cran = c("MASS"), bioc = c("DESeq2"), now = "2026-07-01 05:00:00")
+  run_update(io, out, force_full = FALSE)
+
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, shard_summary))
+  on.exit(DBI::dbDisconnect(con))
+  # If bioc_names() were empty, canonical_name would fall back to the stripped
+  # conda name ("deseq2") rather than the mapped case ("DESeq2"), so this
+  # assertion only passes when the bioc map is actually built and applied.
+  s_bioc <- DBI::dbGetQuery(con, sprintf("SELECT * FROM %s WHERE package='bioconductor-deseq2'", SUMMARY_TABLE))
+  expect_equal(s_bioc$origin, "bioc")
+  expect_equal(s_bioc$canonical_name, "DESeq2")
+
+  s_cran <- DBI::dbGetQuery(con, sprintf("SELECT * FROM %s WHERE package='r-mass'", SUMMARY_TABLE))
+  expect_equal(s_cran$origin, "cran")
+  expect_equal(s_cran$canonical_name, "MASS")
+})
+
 test_that("incremental run adds a new day and touches only that year, recent, and summary", {
   shard_2017 <- paste0(SHARD_PREFIX, "-2017.db")
   shard_2026 <- paste0(SHARD_PREFIX, "-2026.db")
@@ -201,6 +227,85 @@ test_that("incremental run falls back to the cached packages table when cran_nam
   s2 <- DBI::dbGetQuery(con, sprintf("SELECT * FROM %s WHERE package='r-ggplot2'", SUMMARY_TABLE))
   expect_equal(s2$origin, "cran")
   expect_equal(s2$canonical_name, "ggplot2")
+})
+
+test_that("incremental run carries the prior summary forward so first_date does not regress and an inactive package survives in the roster", {
+  shard_summary <- paste0(SHARD_PREFIX, "-summary.db")
+
+  out1 <- withr::local_tempdir()
+  daily1 <- data.frame(
+    date = c("2017-04-05", "2017-04-05", "2026-06-29", "2026-06-30"),
+    package = c("r-mass", "r-oldpkg", "r-mass", "r-ggplot2"),
+    count = c(1L, 1L, 10L, 5L), stringsAsFactors = FALSE)
+  io1 <- fake_io(release_present = FALSE, daily = daily1,
+                 cran = c("MASS", "ggplot2"), now = "2026-07-01 05:00:00")
+  run_update(io1, out1, force_full = FALSE)
+
+  con1 <- DBI::dbConnect(RSQLite::SQLite(), file.path(out1, shard_summary))
+  s1 <- DBI::dbGetQuery(con1, sprintf("SELECT * FROM %s WHERE package='r-mass'", SUMMARY_TABLE))
+  DBI::dbDisconnect(con1)
+  expect_equal(s1$first_date, "2017-04-05")   # sanity: the cold build got this right
+
+  out2 <- withr::local_tempdir()
+  daily2 <- rbind(daily1, data.frame(
+    date = "2026-07-01", package = "r-mass", count = 7L, stringsAsFactors = FALSE))
+  io2 <- fake_io(release_present = TRUE, daily = daily2,
+                 cran = c("MASS", "ggplot2"), now = "2026-07-02 05:00:00",
+                 shards = release_shards(out1))
+  run_update(io2, out2, force_full = FALSE)
+
+  con2 <- DBI::dbConnect(RSQLite::SQLite(), file.path(out2, shard_summary))
+  on.exit(DBI::dbDisconnect(con2))
+  s2_mass <- DBI::dbGetQuery(con2, sprintf("SELECT * FROM %s WHERE package='r-mass'", SUMMARY_TABLE))
+  expect_equal(s2_mass$first_date, "2017-04-05")   # must not regress to the recent-window start
+
+  s2_old <- DBI::dbGetQuery(con2, sprintf("SELECT * FROM %s WHERE package='r-oldpkg'", SUMMARY_TABLE))
+  expect_equal(nrow(s2_old), 1L)                   # must still be present, not vanished
+  expect_equal(s2_old$total_365d, 0L)
+  expect_equal(s2_old$first_date, "2017-04-05")
+})
+
+test_that("force_full re-exports every year shard from the prior manifest, not just the touched-window year", {
+  shard_2017 <- paste0(SHARD_PREFIX, "-2017.db")
+  shard_2026 <- paste0(SHARD_PREFIX, "-2026.db")
+  shard_recent <- paste0(SHARD_PREFIX, "-recent.db")
+  shard_summary <- paste0(SHARD_PREFIX, "-summary.db")
+
+  out1 <- withr::local_tempdir()
+  daily1 <- data.frame(
+    date = c("2017-04-05", "2026-06-29", "2026-06-30"),
+    package = c("r-mass", "r-mass", "r-ggplot2"),
+    count = c(1L, 10L, 5L), stringsAsFactors = FALSE)
+  io1 <- fake_io(release_present = FALSE, daily = daily1,
+                 cran = c("MASS", "ggplot2"), now = "2026-07-01 05:00:00")
+  run_update(io1, out1, force_full = FALSE)
+  # sanity: the prior manifest lists both years, contrast case below
+  man1 <- jsonlite::fromJSON(file.path(out1, "manifest.json"))
+  expect_true(shard_2017 %in% names(man1$shards))
+  expect_true(shard_2026 %in% names(man1$shards))
+
+  # Same underlying source data (fake_io's fetch_daily filters by requested
+  # months, so a fetch spanning full history returns 2017 and 2026 rows alike);
+  # only new fresh data is the 2026-07-01 row, same as the plain-incremental test.
+  out2 <- withr::local_tempdir()
+  daily2 <- rbind(daily1, data.frame(
+    date = "2026-07-01", package = "r-mass", count = 7L, stringsAsFactors = FALSE))
+  io2 <- fake_io(release_present = TRUE, daily = daily2,
+                 cran = c("MASS", "ggplot2"), now = "2026-07-02 05:00:00",
+                 shards = release_shards(out1))
+  res2 <- run_update(io2, out2, force_full = TRUE)
+
+  expect_true(shard_2017 %in% res2$changed_shards)
+  expect_true(shard_2026 %in% res2$changed_shards)
+  expect_true(shard_recent %in% res2$changed_shards)
+  expect_true(shard_summary %in% res2$changed_shards)
+
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out2, shard_2017))
+  on.exit(DBI::dbDisconnect(con))
+  d <- DBI::dbGetQuery(con,
+    sprintf("SELECT count FROM %s WHERE package='r-mass' AND date='2017-04-05'", DAILY_TABLE))
+  expect_equal(nrow(d), 1L)
+  expect_equal(d$count, 1L)
 })
 
 test_that("a same-day re-run replaces rather than duplicates a revised (package, date) row", {

@@ -2,7 +2,7 @@ name: Update bioconda Downloads
 
 on:
   schedule:
-    # Daily at 05:00 UTC, ahead of the r-observatory/data merge (~08:00 UTC).
+    # Daily at 05:15 UTC, ahead of the r-observatory/data merge (~08:00 UTC).
     # Each run aggregates Anaconda's public anaconda-package-data hourly Parquet
     # for the bioconda r-* and bioconductor-* slice into one row per package per UTC day.
     - cron: "15 5 * * *"

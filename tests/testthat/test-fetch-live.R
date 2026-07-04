@@ -2,7 +2,7 @@
 # path against the public anaconda-package-data bucket. Skips cleanly (rather
 # than failing the suite) whenever the network, the S3 bucket, or the httpfs
 # extension install is unavailable, so CI/offline runs are unaffected.
-test_that("fetch_daily returns r- rows for a recent month", {
+test_that("fetch_daily returns r- and bioconductor- rows for a recent month", {
   skip_on_cran()
   skip_if_offline()
 
@@ -11,7 +11,8 @@ test_that("fetch_daily returns r- rows for a recent month", {
     skip(paste("live S3 fetch unavailable:", conditionMessage(e)))
   })
 
-  expect_true(all(startsWith(df$package, "r-")))
+  expect_true(all(startsWith(df$package, "r-") | startsWith(df$package, "bioconductor-")))
+  expect_true(any(startsWith(df$package, "bioconductor-")))
   expect_true(nrow(df) > 1000L)
   expect_true(all(nchar(df$date) == 10L))
 })
