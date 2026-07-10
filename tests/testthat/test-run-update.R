@@ -54,9 +54,11 @@ test_that("cold bootstrap resolves both bioc and cran origins end-to-end through
 
   con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, shard_summary))
   on.exit(DBI::dbDisconnect(con))
-  # If bioc_names() were empty, canonical_name would fall back to the stripped
-  # conda name ("deseq2") rather than the mapped case ("DESeq2"), so this
-  # assertion only passes when the bioc map is actually built and applied.
+  # If the bioc map were empty, "deseq2" would fail to resolve at all, leaving
+  # bioconductor-deseq2 classified as out-of-scope ("other") and dropped from
+  # the summary entirely, rather than falling back to a stripped-name
+  # canonical value. So this assertion only passes when the bioc map is
+  # actually built and applied.
   s_bioc <- DBI::dbGetQuery(con, sprintf("SELECT * FROM %s WHERE package='bioconductor-deseq2'", SUMMARY_TABLE))
   expect_equal(s_bioc$origin, "bioc")
   expect_equal(s_bioc$canonical_name, "DESeq2")
@@ -303,6 +305,20 @@ test_that("cold run drops a conda-only out-of-scope package but publishes an in-
   pkgs <- DBI::dbGetQuery(con, sprintf("SELECT package FROM %s", SUMMARY_TABLE))$package
   expect_true("r-mass" %in% pkgs)
   expect_false("r-yr" %in% pkgs)
+
+  # Dropped from the summary does not mean dropped from history: out-of-scope
+  # packages are classified but not promoted, while their raw daily counts are
+  # still retained in the year shard.
+  shard_2026 <- paste0(SHARD_PREFIX, "-2026.db")
+  con2 <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, shard_2026))
+  on.exit(DBI::dbDisconnect(con2), add = TRUE)
+  raw_yr <- DBI::dbGetQuery(con2,
+    sprintf("SELECT count FROM %s WHERE package='r-yr'", DAILY_TABLE))
+  expect_true(nrow(raw_yr) >= 1L)   # raw rows retained even though out-of-scope
+
+  raw_mass <- DBI::dbGetQuery(con2,
+    sprintf("SELECT count FROM %s WHERE package='r-mass'", DAILY_TABLE))
+  expect_true(nrow(raw_mass) >= 1L)   # sanity: in-scope package's raw rows also present
 })
 
 test_that("incremental run carries the prior summary forward so first_date does not regress and an inactive package survives in the roster", {
