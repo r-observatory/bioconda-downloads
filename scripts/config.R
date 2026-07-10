@@ -7,6 +7,7 @@ PUBLISH_REPO   <- "r-observatory/bioconda-downloads"
 SHARD_PREFIX   <- "bioconda-downloads"      # release-asset filename stem
 TABLE_PREFIX   <- "bioconda"                # SQLite table-name stem
 FORCE_REBUILD_ENV <- "BIOCONDA_FORCE_REBUILD"
+RECLASSIFY_ONLY_ENV <- "BIOCONDA_RECLASSIFY_ONLY"
 
 DAILY_TABLE    <- paste0(TABLE_PREFIX, "_downloads_daily")
 SUMMARY_TABLE  <- paste0(TABLE_PREFIX, "_downloads_summary")
