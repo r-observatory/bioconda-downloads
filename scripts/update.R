@@ -294,7 +294,15 @@ run_update <- function(io, out_dir, force_full = FALSE, reclassify_only = FALSE,
       summary        = list(
         packages    = nrow(post_summary),
         latest_date = DBI::dbGetQuery(work_con, sprintf("SELECT MAX(date) AS d FROM %s", DAILY_TABLE))$d))
-    write_manifest(manifest_path, out)
+    # Integrity / completeness core for the summary DB the downstream merge
+    # pulls, computed from the finalized on-disk summary shard (exported above)
+    # so db_bytes/db_sha256/tables describe the exact bytes about to be
+    # uploaded. complete = TRUE: the summary shard is fully rewritten every run,
+    # its widest rolling window (365d) sits inside the always-loaded 400-day
+    # recent shard, and the prior-summary merge preserves the full roster and
+    # date spans -- so the published summary is a complete snapshot each run.
+    integrity_core <- summary_integrity_core(summary_path, complete = TRUE)
+    write_manifest(manifest_path, out, core = integrity_core)
     write_release_notes(file.path(out_dir, "release_notes.md"), out, RELEASE_CAVEAT)
     return(list(changed_shards = changed_shards, manifest = out))
   }
@@ -353,7 +361,11 @@ run_update <- function(io, out_dir, force_full = FALSE, reclassify_only = FALSE,
     summary        = list(
       packages    = nrow(summary_df),
       latest_date = if (nrow(daily) > 0) max(daily$date) else NA_character_))
-  write_manifest(manifest_path, out)
+  # Integrity / completeness core for the finalized summary shard (exported
+  # above). A cold bootstrap fetches full history, so its summary is a complete
+  # snapshot: complete = TRUE.
+  integrity_core <- summary_integrity_core(summary_path, complete = TRUE)
+  write_manifest(manifest_path, out, core = integrity_core)
   write_release_notes(file.path(out_dir, "release_notes.md"), out, RELEASE_CAVEAT)
   list(changed_shards = changed_shards, manifest = out)
 }
