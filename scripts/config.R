@@ -45,4 +45,5 @@ RELEASE_CAVEAT <- paste(
   "best-effort deduped by Anaconda) for both r-* CRAN rebuilds and bioconductor-*",
   "packages. r-* counts overlap conceptually with the CRAN packages tracked by this",
   "project's other conda-channel pipeline, per-platform detail is dropped, and totals",
-  "are not directly comparable across sources.")
+  "are not directly comparable across sources.",
+  "Anaconda publishes the daily files about once a month, for the month before.")

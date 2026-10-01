@@ -294,13 +294,12 @@ run_update <- function(io, out_dir, force_full = FALSE, reclassify_only = FALSE,
       summary        = list(
         packages    = nrow(post_summary),
         latest_date = DBI::dbGetQuery(work_con, sprintf("SELECT MAX(date) AS d FROM %s", DAILY_TABLE))$d))
-    # Integrity / completeness core for the summary DB the downstream merge
-    # pulls, computed from the finalized on-disk summary shard (exported above)
-    # so db_bytes/db_sha256/tables describe the exact bytes about to be
-    # uploaded. complete = TRUE: the summary shard is fully rewritten every run,
-    # its widest rolling window (365d) sits inside the always-loaded 400-day
-    # recent shard, and the prior-summary merge preserves the full roster and
-    # date spans -- so the published summary is a complete snapshot each run.
+    # Integrity/completeness core for the summary DB the downstream merge pulls,
+    # computed from the exact bytes of the summary shard finalized above
+    # (export_summary_shard), so db_bytes/db_sha256 describe the file that is on
+    # the release. The summary is a full per-run snapshot: its 30/90/365d windows
+    # sit inside the always-loaded RECENT_WINDOW and merge_prior_summary carries
+    # the full roster + first/last dates forward, so complete = TRUE.
     integrity_core <- summary_integrity_core(summary_path, complete = TRUE)
     write_manifest(manifest_path, out, core = integrity_core)
     write_release_notes(file.path(out_dir, "release_notes.md"), out, RELEASE_CAVEAT)
@@ -361,9 +360,10 @@ run_update <- function(io, out_dir, force_full = FALSE, reclassify_only = FALSE,
     summary        = list(
       packages    = nrow(summary_df),
       latest_date = if (nrow(daily) > 0) max(daily$date) else NA_character_))
-  # Integrity / completeness core for the finalized summary shard (exported
-  # above). A cold bootstrap fetches full history, so its summary is a complete
-  # snapshot: complete = TRUE.
+  # Integrity/completeness core for the summary DB the downstream merge pulls,
+  # computed from the exact bytes of the summary shard finalized above. The cold
+  # bootstrap loads the full history from HISTORY_START into the working DB, so
+  # the summary is a complete snapshot: complete = TRUE.
   integrity_core <- summary_integrity_core(summary_path, complete = TRUE)
   write_manifest(manifest_path, out, core = integrity_core)
   write_release_notes(file.path(out_dir, "release_notes.md"), out, RELEASE_CAVEAT)
