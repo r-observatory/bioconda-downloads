@@ -285,8 +285,8 @@ file_sha256 <- function(path) {
 #'   * tables      - named list mapping each user table to its row count
 #'   * complete    - passed through by the caller. complete = the DB holds the
 #'                   full, non-partial dataset (a full rebuild each run);
-#'                   freshness is tracked separately via generated_at and
-#'                   last_checked. A pipeline with a genuine partial/bootstrap
+#'                   freshness is tracked separately via generated_at (and
+#'                   last_changed). A pipeline with a genuine partial/bootstrap
 #'                   state would derive this instead of hardcoding it.
 #' Lets a downstream merge content-verify the asset it pulls and confirm the
 #' expected tables/rows are present.
@@ -321,14 +321,13 @@ summary_integrity_core <- function(db_path, complete = TRUE) {
 
 # Write the manifest as pretty JSON. `changed_shards` must be passed as a list
 # (e.g. as.list(character(0)) or as.list(chr_vec)) so it serializes as a JSON
-# array even when empty, never as `{}` or `null`.
-# `core` (optional) is a named list of TOP-LEVEL fields to merge into the
-# manifest - used to attach the integrity/completeness core built by
-# summary_integrity_core() (db_filename, db_bytes, db_sha256, tables, complete).
+# array even when empty, never as `{}` or `null`. `core` (optional) is a named
+# list of TOP-LEVEL fields (from summary_integrity_core()) merged into the
+# manifest via `obj <- c(obj, core)` so they serialize as top-level keys, not
+# nested - used to attach the integrity/completeness core describing the
+# summary DB the downstream merge pulls.
 write_manifest <- function(path, obj, core = NULL) {
-  if (!is.null(core)) {
-    obj <- c(obj, core)  # merge as top-level fields, not nested
-  }
+  if (!is.null(core)) obj <- c(obj, core)
   writeLines(jsonlite::toJSON(obj, auto_unbox = TRUE, pretty = TRUE, null = "null"), path)
 }
 
