@@ -501,3 +501,123 @@ test_that("a same-day re-run replaces rather than duplicates a revised (package,
   expect_equal(nrow(rows), 1L)     # replaced, not duplicated
   expect_equal(rows$count, 22L)
 })
+
+test_that("a ledger change with no new counts republishes the summary with the recent shard, and the manifest describes that summary", {
+  shard_recent <- paste0(SHARD_PREFIX, "-recent.db")
+  shard_summary <- paste0(SHARD_PREFIX, "-summary.db")
+
+  out1 <- withr::local_tempdir()
+  daily <- data.frame(
+    date = c("2017-04-05", "2026-06-29", "2026-06-30"),
+    package = c("r-mass", "r-mass", "r-ggplot2"),
+    count = c(1L, 10L, 5L), stringsAsFactors = FALSE)
+  io1 <- fake_io(release_present = FALSE, daily = daily,
+                 cran = c("MASS"), now = "2026-07-01 05:00:00")
+  run_update(io1, out1, force_full = FALSE, live_floor = 1L, bioc_floor = 0L)
+
+  out2 <- withr::local_tempdir()
+  io2 <- fake_io(release_present = TRUE, daily = daily,   # same counts, the ledger now knows ggplot2
+                 cran = c("MASS", "ggplot2"), now = "2026-07-02 05:00:00",
+                 shards = release_shards(out1))
+  res2 <- run_update(io2, out2, force_full = FALSE, live_floor = 1L, bioc_floor = 0L)
+
+  expect_setequal(res2$changed_shards, c(shard_recent, shard_summary))
+  s <- read_summary_table(file.path(out2, shard_summary))
+  expect_setequal(s$package, c("r-mass", "r-ggplot2"))
+  expect_setequal(read_summary_table(file.path(out2, shard_recent))$package, c("r-mass", "r-ggplot2"))
+  man2 <- jsonlite::fromJSON(file.path(out2, "manifest.json"))
+  expect_equal(man2$db_sha256, file_sha256(file.path(out2, shard_summary)))
+})
+
+test_that("with nothing new, the manifest describes the summary already on the release", {
+  shard_summary <- paste0(SHARD_PREFIX, "-summary.db")
+
+  out1 <- withr::local_tempdir()
+  daily <- data.frame(
+    date = c("2017-04-05", "2026-06-29", "2026-06-30"),
+    package = c("r-mass", "r-mass", "r-ggplot2"),
+    count = c(1L, 10L, 5L), stringsAsFactors = FALSE)
+  io1 <- fake_io(release_present = FALSE, daily = daily,
+                 cran = c("MASS", "ggplot2"), now = "2026-07-01 05:00:00")
+  run_update(io1, out1, force_full = FALSE, live_floor = 1L, bioc_floor = 0L)
+
+  # The release's copy holds the same rows in different bytes, as one written by an older SQLite would.
+  published <- file.path(withr::local_tempdir(), shard_summary)
+  file.copy(file.path(out1, shard_summary), published)
+  pcon <- DBI::dbConnect(RSQLite::SQLite(), published)
+  DBI::dbExecute(pcon, "PRAGMA user_version = 7")
+  DBI::dbDisconnect(pcon)
+  shards <- as.list(release_shards(out1))
+  shards[[shard_summary]] <- published
+
+  out2 <- withr::local_tempdir()
+  io2 <- fake_io(release_present = TRUE, daily = daily,
+                 cran = c("MASS", "ggplot2"), now = "2026-07-02 05:00:00", shards = shards)
+  res2 <- run_update(io2, out2, force_full = FALSE, live_floor = 1L, bioc_floor = 0L)
+
+  expect_length(res2$changed_shards, 0L)
+  man2 <- jsonlite::fromJSON(file.path(out2, "manifest.json"))
+  expect_equal(man2$db_sha256, file_sha256(published))
+  expect_equal(man2$db_bytes, file.size(published))
+})
+
+test_that("an identity fallback with no new counts leaves the release's summary and its checksum in place", {
+  shard_summary <- paste0(SHARD_PREFIX, "-summary.db")
+
+  out1 <- withr::local_tempdir()
+  daily <- data.frame(
+    date = c("2017-04-05", "2026-06-29", "2026-06-30"),
+    package = c("r-mass", "r-mass", "r-ggplot2"),
+    count = c(1L, 10L, 5L), stringsAsFactors = FALSE)
+  io1 <- fake_io(release_present = FALSE, daily = daily,
+                 cran = c("MASS", "ggplot2"), now = "2026-07-01 05:00:00")
+  run_update(io1, out1, force_full = FALSE, live_floor = 1L, bioc_floor = 0L)
+
+  out2 <- withr::local_tempdir()
+  io2 <- fake_io(release_present = TRUE, daily = daily,
+                 cran = c("MASS", "ggplot2"), now = "2026-07-02 05:00:00",
+                 shards = release_shards(out1), fail_identity = TRUE)
+  res2 <- run_update(io2, out2, force_full = FALSE, live_floor = 1L, bioc_floor = 0L)
+
+  # The cached identity has no identity_state, so its summary must not replace the release's.
+  expect_length(res2$changed_shards, 0L)
+  man2 <- jsonlite::fromJSON(file.path(out2, "manifest.json"))
+  expect_equal(man2$db_sha256, file_sha256(file.path(out1, shard_summary)))
+})
+
+test_that("force_full aborts rather than publish a year shard with fewer rows than the release lists", {
+  shard_2017 <- paste0(SHARD_PREFIX, "-2017.db")
+
+  out1 <- withr::local_tempdir()
+  daily1 <- data.frame(
+    date = c("2017-04-05", "2026-06-29", "2026-06-30"),
+    package = c("r-mass", "r-mass", "r-ggplot2"),
+    count = c(1L, 10L, 5L), stringsAsFactors = FALSE)
+  io1 <- fake_io(release_present = FALSE, daily = daily1,
+                 cran = c("MASS", "ggplot2"), now = "2026-07-01 05:00:00")
+  run_update(io1, out1, force_full = FALSE, live_floor = 1L, bioc_floor = 0L)
+
+  # The 2017 shard comes down short and the source no longer has the row either.
+  short <- file.path(withr::local_tempdir(), shard_2017)
+  file.copy(file.path(out1, shard_2017), short)
+  scon <- DBI::dbConnect(RSQLite::SQLite(), short)
+  DBI::dbExecute(scon, sprintf("DELETE FROM %s", DAILY_TABLE))
+  DBI::dbDisconnect(scon)
+  shards <- as.list(release_shards(out1))
+  shards[[shard_2017]] <- short
+
+  out2 <- withr::local_tempdir()
+  io2 <- fake_io(release_present = TRUE, daily = daily1[daily1$date != "2017-04-05", ],
+                 cran = c("MASS", "ggplot2"), now = "2026-07-02 05:00:00", shards = shards)
+  expect_error(run_update(io2, out2, force_full = TRUE, live_floor = 1L, bioc_floor = 0L),
+               "protect accumulated history")
+  expect_false(file.exists(file.path(out2, "release_notes.md")))
+})
+
+test_that("assert_summary_keeps stops when a package on the release would be dropped", {
+  prior <- data.frame(package = c("r-mass", "r-ggplot2"), stringsAsFactors = FALSE)
+  expect_silent(assert_summary_keeps(prior, data.frame(package = c("r-mass", "r-ggplot2", "r-new"))))
+  expect_silent(assert_summary_keeps(NULL, data.frame(package = "r-mass")))
+  expect_error(assert_summary_keeps(prior, data.frame(package = "r-mass")),
+               "r-ggplot2.*protect accumulated history")
+})
